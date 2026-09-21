@@ -3,7 +3,6 @@
 namespace App\Filament\Resources\InvoiceResource\Pages;
 
 use App\Filament\Resources\InvoiceResource;
-use Filament\Actions;
 use Filament\Resources\Pages\ViewRecord;
 
 class ViewInvoice extends ViewRecord
@@ -13,7 +12,7 @@ class ViewInvoice extends ViewRecord
     protected function getHeaderActions(): array
     {
         return [
-            Actions\EditAction::make(),
+            // Dikosongkan agar tidak ada tombol Edit / Delete di halaman View
         ];
     }
 }
