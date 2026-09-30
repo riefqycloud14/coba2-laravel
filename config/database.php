@@ -110,6 +110,20 @@ return [
             'prefix_indexes' => true,
         ],
 
+'sqlsrv_ax' => [
+    'driver' => 'sqlsrv',
+    'host' => '172.16.8.13',
+    'port' => '1433',
+    'database' => 'Ax_2009_Live',
+    'username' => 'WebMyAX',
+    'password' => '753Tokina',
+    'charset' => 'utf8',
+    'prefix' => '',
+    'encrypt' => 'no',
+    'trust_server_certificate' => true,
+    'login_timeout' => 5,
+],
+
 // === KONEKSI SERVER AXAPTA SAMARINDA (BU 59) ===
         'axapta_smd' => [
             'driver' => 'sqlsrv',

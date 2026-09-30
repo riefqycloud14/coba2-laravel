@@ -30,9 +30,6 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
     protected static string $view = 'filament.pages.raw-invoice-history';
 
     public ?array $data = [];
-    public bool $isProcessed = false;
-    public string $tglAwalShow = '';
-    public string $tglAkhirShow = '';
 
     public function mount(): void
     {
@@ -51,9 +48,11 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
                     ->schema([
                         Forms\Components\DatePicker::make('tgl_awal')
                             ->label('Tanggal Awal')
+                            ->live()
                             ->required(),
                         Forms\Components\DatePicker::make('tgl_akhir')
                             ->label('Tanggal Akhir')
+                            ->live()
                             ->required(),
                     ])->columns(2),
             ])
@@ -65,20 +64,23 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
         $formData = $this->form->getState();
 
         try {
+            // Set time limit agar tidak timeout saat tarik data besar dari Axapta
+            set_time_limit(600);
+
+            // 1. Tarik Data Transaksi Invoice (IP 10.1.1.64)
             $syncService->syncTransactionAndCustomer(
                 $formData['tgl_awal'],
                 $formData['tgl_akhir']
             );
 
-            $this->isProcessed  = true;
-            $this->tglAwalShow  = $formData['tgl_awal'];
-            $this->tglAkhirShow = $formData['tgl_akhir'];
+            // 2. Tarik Master Customer (IP 10.1.1.64)
+            $syncService->syncCustomers();
 
             $this->resetTable();
 
             Notification::make()
                 ->title('Penarikan Data Berhasil!')
-                ->body('Data berhasil diperbarui di Data Master Invoices.')
+                ->body('Data Invoice & Master Customer berhasil diperbarui.')
                 ->success()
                 ->send();
 
@@ -95,13 +97,12 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
     {
         return $table
             ->query(function () {
-                if (!$this->isProcessed) {
-                    return Invoice::query()->whereRaw('1 = 0');
-                }
+                $tglAwal  = $this->data['tgl_awal'] ?? now()->startOfMonth()->format('Y-m-d');
+                $tglAkhir = $this->data['tgl_akhir'] ?? now()->format('Y-m-d');
 
+                // OPTIMASI 1: Gunakan whereBetween alih-alih whereDate
                 return Invoice::query()
-                    ->whereDate('tglfak', '>=', $this->tglAwalShow)
-                    ->whereDate('tglfak', '<=', $this->tglAkhirShow)
+                    ->whereBetween('tglfak', [$tglAwal . ' 00:00:00', $tglAkhir . ' 23:59:59'])
                     ->orderBy('tglfak', 'asc');
             })
             ->headerActions([
@@ -110,13 +111,18 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
                     ->icon('heroicon-m-document-arrow-down')
                     ->color('success')
                     ->action(function (): StreamedResponse {
-                        $fileName = "Data_Utama_Lengkap_{$this->tglAwalShow}_sd_{$this->tglAkhirShow}.csv";
+                        // OPTIMASI 2: Hilangkan batas waktu eksekusi PHP untuk ekspor
+                        set_time_limit(0);
 
-                        return response()->streamDownload(function () {
+                        $tglAwal  = $this->data['tgl_awal'] ?? now()->startOfMonth()->format('Y-m-d');
+                        $tglAkhir = $this->data['tgl_akhir'] ?? now()->format('Y-m-d');
+                        $fileName = "Data_Utama_Lengkap_{$tglAwal}_sd_{$tglAkhir}.csv";
+
+                        return response()->streamDownload(function () use ($tglAwal, $tglAkhir) {
                             $handle = fopen('php://output', 'w');
                             fputs($handle, "\xEF\xBB\xBF"); // Format BOM UTF-8 untuk Excel
 
-                            // Header CSV Lengkap dengan Data Buku
+                            // Header CSV Lengkap
                             fputcsv($handle, [
                                 'No Invoice', 
                                 'BU', 
@@ -146,8 +152,8 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
                                 'Nett Biaya'
                             ]);
 
-                            // Query JOIN menggabungkan Invoices + Customers + Items
-                            DB::table('invoices as i')
+                            // OPTIMASI 3: Gunakan cursor() alih-alih chunk() agar bebas dari Offset overhead
+                            $query = DB::table('invoices as i')
                                 ->leftJoin('customers as c', function ($join) {
                                     $join->on('i.accountnum', '=', 'c.accountnum')
                                          ->on('i.bu', '=', 'c.dimension');
@@ -162,41 +168,39 @@ class RawInvoiceHistory extends Page implements HasForms, HasTable
                                     'i.swa', 'i.subtot', 'i.total', 'i.tr', 'i.totaltr', 
                                     'i.trbiaya', 'i.totalbiaya', 'i.netto', 'i.nettbiaya'
                                 ])
-                                ->whereDate('i.tglfak', '>=', $this->tglAwalShow)
-                                ->whereDate('i.tglfak', '<=', $this->tglAkhirShow)
-                                ->orderBy('i.tglfak', 'asc')
-                                ->chunk(500, function ($rows) use ($handle) {
-                                    foreach ($rows as $r) {
-                                        fputcsv($handle, [
-                                            '="' . ($r->invoice_no ?? '') . '"',
-                                            $r->bu ?? '',
-                                            $r->tglfak ?? '',
-                                            $r->tglax ?? '',
-                                            $r->type ?? '',
-                                            '="' . ($r->accountnum ?? '') . '"',
-                                            $r->customer_name ?? '',
-                                            $r->sekolah ?? '',
-                                            $r->city ?? '',
-                                            '="' . ($r->kodbuk ?? '') . '"',
-                                            $r->nama_buku ?? '',
-                                            $r->pngarang ?? $r->pengarang ?? '',
-                                            number_format($r->kwantum ?? 0, 0, '', ''),
-                                            number_format($r->harga ?? 0, 0, '', ''),
-                                            $r->salesunit ?? '',
-                                            $r->sumberdana ?? '',
-                                            $r->program ?? '',
-                                            $r->swa ?? '',
-                                            number_format($r->subtot ?? 0, 0, '', ''),
-                                            number_format($r->total ?? 0, 0, '', ''),
-                                            number_format($r->tr ?? 0, 2, '.', ''),
-                                            number_format($r->totaltr ?? 0, 0, '', ''),
-                                            number_format($r->trbiaya ?? 0, 2, '.', ''),
-                                            number_format($r->totalbiaya ?? 0, 0, '', ''),
-                                            number_format($r->netto ?? 0, 0, '', ''),
-                                            number_format($r->nettbiaya ?? 0, 0, '', ''),
-                                        ]);
-                                    }
-                                });
+                                ->whereBetween('i.tglfak', [$tglAwal . ' 00:00:00', $tglAkhir . ' 23:59:59'])
+                                ->orderBy('i.tglfak', 'asc');
+
+                            foreach ($query->cursor() as $r) {
+                                fputcsv($handle, [
+                                    '="' . ($r->invoice_no ?? '') . '"',
+                                    $r->bu ?? '',
+                                    $r->tglfak ?? '',
+                                    $r->tglax ?? '',
+                                    $r->type ?? '',
+                                    '="' . ($r->accountnum ?? '') . '"',
+                                    $r->customer_name ?? '',
+                                    $r->sekolah ?? '',
+                                    $r->city ?? '',
+                                    '="' . ($r->kodbuk ?? '') . '"',
+                                    $r->nama_buku ?? '',
+                                    $r->pengarang ?? '',
+                                    number_format($r->kwantum ?? 0, 0, '', ''),
+                                    number_format($r->harga ?? 0, 0, '', ''),
+                                    $r->salesunit ?? '',
+                                    $r->sumberdana ?? '',
+                                    $r->program ?? '',
+                                    $r->swa ?? '',
+                                    number_format($r->subtot ?? 0, 0, '', ''),
+                                    number_format($r->total ?? 0, 0, '', ''),
+                                    number_format($r->tr ?? 0, 2, '.', ''),
+                                    number_format($r->totaltr ?? 0, 0, '', ''),
+                                    number_format($r->trbiaya ?? 0, 2, '.', ''),
+                                    number_format($r->totalbiaya ?? 0, 0, '', ''),
+                                    number_format($r->netto ?? 0, 0, '', ''),
+                                    number_format($r->nettbiaya ?? 0, 0, '', ''),
+                                ]);
+                            }
 
                             fclose($handle);
                         }, $fileName, ['Content-Type' => 'text/csv; charset=UTF-8']);
