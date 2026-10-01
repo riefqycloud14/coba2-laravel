@@ -553,6 +553,7 @@ class AxaptaSyncService
 
     /**
      * TAHAP 5: Penarikan SO Outstanding 41 Kolom Lengkap
+     * Otomatis memetakan manager_ax (SAMARINDA / BALIKPAPAN / PTK) via ERL_SUX_Organisasi_2026
      */
     public function syncSalesOrderOutstandings(): void
     {
@@ -560,11 +561,6 @@ class AxaptaSyncService
         ini_set('memory_limit', '512M');
 
         \App\Models\SalesOrderOutstanding::truncate();
-
-        $branches = [
-            '59' => ['table' => 'SOOUTSTANDING59'],
-            '61' => ['table' => 'SOOUTSTANDING61'],
-        ];
 
         config([
             'database.connections.sqlsrv_ax_live' => [
@@ -584,6 +580,45 @@ class AxaptaSyncService
         ]);
 
         DB::purge('sqlsrv_ax_live');
+
+
+// 1. Ambil Pemetaan Sales Unit -> Manager & Nama Manager dari ERL_SUX_Organisasi_2026
+$territoryMap = [];
+try {
+    $orgs = DB::connection('sqlsrv_ax_live')
+        ->table('ERL_SUX_Organisasi_2026')
+        ->where('active', 1)
+        ->select('salesunitid', 'nammgr', 'nammgr_name') // <--- Tambahkan nammgr_name[cite: 13]
+        ->get();
+
+    foreach ($orgs as $o) {
+        $mgr = strtoupper(trim($o->nammgr ?? ''));
+        $mgrName = trim($o->nammgr_name ?? ''); // <--- Ambil nama manager[cite: 13]
+
+        $labelMgr = $mgr;
+        if (str_contains($mgr, 'BALIKPAPAN')) {
+            $labelMgr = 'MANAGER BALIKPAPAN';
+        } elseif (str_contains($mgr, 'SAMARINDA')) {
+            $labelMgr = 'MANAGER SAMARINDA';
+        } elseif (str_contains($mgr, 'BANJARMASIN')) {
+            $labelMgr = 'MANAGER BANJARMASIN';
+        }
+
+        if (!empty($labelMgr)) {
+            $territoryMap[trim($o->salesunitid)] = [
+                'manager_ax'   => $labelMgr,
+                'manager_name' => $mgrName,
+            ];
+        }
+    }
+} catch (\Exception $e) {
+    Log::error("Gagal membaca tabel ERL_SUX_Organisasi_2026: " . $e->getMessage());
+}
+
+        $branches = [
+            '59' => ['table' => 'SOOUTSTANDING59'],
+            '61' => ['table' => 'SOOUTSTANDING61'],
+        ];
 
         foreach ($branches as $bu => $config) {
             try {
@@ -606,15 +641,29 @@ class AxaptaSyncService
                     $arr = (array) $row;
                     $getVal = fn($k) => collect($arr)->first(fn($v, $key) => strtolower($key) === strtolower($k));
 
+                    $salesId   = trim($getVal('salesid') ?? '');
+                    $school    = strtoupper(trim($getVal('agr_schoolid') ?? ''));
+                    $salesUnit = trim($getVal('salesunitid') ?? '');
+
+                    // 2. Filter abaikan order SOI, Pameran, Konsinyasi (Persis seperti FoxPro)
+                    if (str_contains($salesId, 'SOI') || str_contains($school, 'PAMERAN') || str_contains($school, 'KONSINYASI')) {
+                        continue;
+                    }
+
+                    // 3. Tentukan Manager_AX dan Manager_Name dari hasil map
+$salesUnitInfo = $territoryMap[$salesUnit] ?? null;
+
+$managerAx   = $salesUnitInfo['manager_ax'] ?? ($bu === '61' ? 'MANAGER PTK' : 'MANAGER SAMARINDA');
+$managerName = $salesUnitInfo['manager_name'] ?? null; // <--- Nama Manager
+
                     $qty         = (float) ($getVal('qtyordered') ?? $getVal('qty') ?? 0);
                     $soEks       = (int) abs($qty);
                     $price       = (float) ($getVal('salesprice') ?? 0);
                     $linePercent = (float) ($getVal('linepercent') ?? 0);
-                    $lineDisc    = (float) ($getVal('linedisc') ?? 0);
+                    $salesGroup  = (float) ($getVal('salesgroup') ?? 0);
 
-                    $gross    = $soEks * $price;
-                    $soAmount = $gross - ($gross * ($linePercent / 100));
-                    $soNett   = $soAmount - $lineDisc;
+                    $soAmount = ($soEks * $price) - ($soEks * $price * ($linePercent / 100));
+                    $soNett   = $soAmount - ($soEks * $price * ($salesGroup / 100));
 
                     $dim3 = strtoupper(trim($getVal('dimension3_') ?? ''));
                     $jenisSo = 'REGULER';
@@ -628,15 +677,17 @@ class AxaptaSyncService
 
                     $insertData[] = [
                         'bu'                    => (int) $bu,
+                        'manager_ax'            => $managerAx,
+                        'manager_name'          => $managerName,
                         'so_eks'                => $soEks,
                         'so_amount'             => $soAmount,
                         'so_nett'               => $soNett,
                         'swa'                   => str_contains($dim3, 'SWA') ? 'SWA' : 'NSW',
                         'jenis_so'              => $jenisSo,
-                        'sales_id'              => trim($getVal('salesid') ?? ''),
+                        'sales_id'              => $salesId,
                         'sales_responsible'     => trim($getVal('salesresponsible') ?? ''),
                         'sales_status'          => $getVal('salesstatus'),
-                        'sales_unit_id'         => trim($getVal('salesunitid') ?? ''),
+                        'sales_unit_id'         => $salesUnit,
                         'agr_sales_resp_name'   => trim($getVal('agr_salesrespname') ?? ''),
                         'created_date_time1'    => $getVal('createddatetime1'),
                         'dimension'             => trim($getVal('dimension') ?? ''),
@@ -652,14 +703,14 @@ class AxaptaSyncService
                         'item_id'               => trim($getVal('itemid') ?? ''),
                         'qty_ordered'           => $qty,
                         'sales_price'           => $price,
-                        'line_disc'             => $lineDisc,
+                        'line_disc'             => (float) ($getVal('linedisc') ?? 0),
                         'sales_group'           => trim($getVal('salesgroup') ?? ''),
                         'line_amount'           => (float) ($getVal('lineamount') ?? 0),
                         'invent_dim_id'         => trim($getVal('inventdimid') ?? ''),
                         'line_percent'          => $linePercent,
                         'dataareaid_3'          => trim($getVal('dataareaid#3') ?? ''),
                         'account_num'           => trim($getVal('accountnum') ?? ''),
-                        'agr_school_id'         => trim($getVal('agr_schoolid') ?? ''),
+                        'agr_school_id'         => $school,
                         'dataareaid_4'          => trim($getVal('dataareaid#4') ?? ''),
                         'item_name'             => trim($getVal('itemname') ?? ''),
                         'agr_pengarang'         => trim($getVal('agr_pengarang') ?? ''),
@@ -702,37 +753,4 @@ class AxaptaSyncService
         $this->syncStocks();
         $this->syncSalesOrderOutstandings();
     }
-
-    // /**
-    //  * METHOD SEMENTARA: Mengecek Daftar Seluruh Kolom di Tabel INVENTTABLE Axapta
-    //  */
-    // public function checkInventtableColumns()
-    // {
-    //     config([
-    //         'database.connections.sqlsrv_ax_live' => [
-    //             'driver'                   => 'sqlsrv',
-    //             'host'                     => '172.16.8.13',
-    //             'port'                     => '1433',
-    //             'database'                 => 'Ax_2009_Live',
-    //             'username'                 => 'WebMyAX',
-    //             'password'                 => '753Tokina',
-    //             'charset'                  => 'utf8',
-    //             'prefix'                   => '',
-    //             'encrypt'                  => env('DB_ENCRYPT', 'no'),
-    //             'trust_server_certificate' => true,
-    //         ]
-    //     ]);
-
-    //     $columns = DB::connection('sqlsrv_ax_live')
-    //         ->select("
-    //             SELECT COLUMN_NAME 
-    //             FROM INFORMATION_SCHEMA.COLUMNS 
-    //             WHERE TABLE_NAME = 'INVENTTABLE' 
-    //             ORDER BY COLUMN_NAME
-    //         ");
-
-    //     $columnNames = array_map(fn($col) => $col->COLUMN_NAME, $columns);
-
-    //     dd($columnNames);
-    // }
 }
