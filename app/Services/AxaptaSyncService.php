@@ -17,7 +17,6 @@ class AxaptaSyncService
         set_time_limit(0);
         ini_set('memory_limit', '512M');
 
-        // Banjarmasin (81) dihapus dari daftar penarikan
         $branches = [
             ['bu' => '61', 'username' => 'IT61', 'password' => 'ITPTK61Erl101', 'label' => 'Pontianak'],
             ['bu' => '59', 'username' => 'IT59', 'password' => '59SMD101Erl', 'label' => 'Samarinda'],
@@ -312,8 +311,7 @@ class AxaptaSyncService
     }
 
     /**
-     * TAHAP TAMBAHAN: Sync Master Item / Buku Lengkap dari INVENTTABLE Axapta
-     * Penyesuaian Kolom: AGR_BRANDID & AGR_ITEMGRADE
+     * TAHAP TAMBAHAN: Sync Master Item
      */
     public function syncItems(): void
     {
@@ -347,8 +345,8 @@ class AxaptaSyncService
                     'ITEMNAME as itemname',
                     'AGR_PENGARANG as agr_pengarang',
                     'AGR_ITEMCURRICULUM as agr_itemcurriculum',
-                    'AGR_BRANDID as agr_brandname',     // Menggunakan AGR_BRANDID dari INVENTTABLE
-                    'AGR_ITEMGRADE as agr_gradename',   // Menggunakan AGR_ITEMGRADE dari INVENTTABLE
+                    'AGR_BRANDID as agr_brandname',
+                    'AGR_ITEMGRADE as agr_gradename',
                 ])
                 ->orderBy('ITEMID')
                 ->chunk(1000, function ($items) {
@@ -383,29 +381,26 @@ class AxaptaSyncService
     }
 
     /**
-     * TAHAP 4: Penarikan Stok, Transit & PO Outstanding per Cabang (Hanya BU 59 & 61)
+     * TAHAP 4: Penarikan Stok, Transit & PO Outstanding (Dioptimasi dengan Batch Bulk Insert/Upsert)
      */
     public function syncStocks(): void
     {
         set_time_limit(0);
         ini_set('memory_limit', '512M');
 
-        // Pastikan Master Item disinkronkan terlebih dahulu
         $this->syncItems();
 
-        // Ambil kodbuk dari transaksi invoice DAN master items lokal
+        // Cuma ambil Item ID yang aktif transaksi di Invoice
         $activeItemIds = DB::table('invoices')
             ->whereNotNull('kodbuk')
             ->where('kodbuk', '<>', '')
             ->pluck('kodbuk')
-            ->merge(DB::table('items')->pluck('itemid'))
-            ->filter()
             ->unique()
             ->values()
             ->toArray();
 
         if (empty($activeItemIds)) {
-            Log::warning("Sync Stok dibatalkan: Tidak ada item/kodbuk di master invoice atau master items.");
+            Log::warning("Sync Stok dibatalkan: Tidak ada item/kodbuk di invoice.");
             return;
         }
 
@@ -415,8 +410,6 @@ class AxaptaSyncService
         ];
 
         $tahunIni = date('Y');
-
-        // Bagi array item menjadi pecahan maksimal 1.000 item per kelompok
         $itemChunks = array_chunk($activeItemIds, 1000);
 
         foreach ($branches as $bu => $config) {
@@ -440,108 +433,122 @@ class AxaptaSyncService
             DB::purge('sqlsrv_ax_live');
 
             try {
-                // 1. Stok Fisik
-                try {
-                    foreach ($itemChunks as $chunk) {
-                        $stokFisik = DB::connection('sqlsrv_ax_live')
-                            ->table('ERL_STOCKPOSITIONDB')
-                            ->select(
-                                DB::raw("INVENTLOCATIONID as wh"),
-                                DB::raw("ITEMID as itemid"),
-                                DB::raw("SUM(SUMOFAVAILPHYSICAL) as total_stok")
-                            )
-                            ->where('INVENTSITEID', $config['site'])
-                            ->whereIn('ITEMID', $chunk)
-                            ->groupBy('INVENTLOCATIONID', 'ITEMID')
-                            ->get();
+                $stockBatch = [];
 
-                        foreach ($stokFisik as $row) {
-                            if (trim($row->wh) === '66') continue;
+                // 1. Tarik Stok Fisik dalam Batch
+                foreach ($itemChunks as $chunk) {
+                    $stokFisik = DB::connection('sqlsrv_ax_live')
+                        ->table('ERL_STOCKPOSITIONDB')
+                        ->select(
+                            DB::raw("INVENTLOCATIONID as wh"),
+                            DB::raw("ITEMID as itemid"),
+                            DB::raw("SUM(SUMOFAVAILPHYSICAL) as total_stok")
+                        )
+                        ->where('INVENTSITEID', $config['site'])
+                        ->whereIn('ITEMID', $chunk)
+                        ->groupBy('INVENTLOCATIONID', 'ITEMID')
+                        ->get();
 
-                            DB::table('stocks')->updateOrInsert(
-                                [
-                                    'bu'               => $bu,
-                                    'inventlocationid' => trim($row->wh),
-                                    'itemid'           => trim($row->itemid),
-                                ],
-                                [
-                                    'stok_physical'    => (float) $row->total_stok,
-                                    'updated_at'       => now(),
-                                ]
-                            );
-                        }
+                    foreach ($stokFisik as $row) {
+                        $wh = trim($row->wh);
+                        if ($wh === '66') continue;
+
+                        $stockBatch[] = [
+                            'bu'               => $bu,
+                            'inventlocationid' => $wh,
+                            'itemid'           => trim($row->itemid),
+                            'stok_physical'    => (float) $row->total_stok,
+                            'updated_at'       => now(),
+                        ];
                     }
-                } catch (Exception $e) {
-                    Log::error("Gagal Tarik Stok Fisik BU {$bu}: " . $e->getMessage());
                 }
 
-                // 2. Stok Transit
-                try {
-                    foreach ($itemChunks as $chunk) {
-                        $stokTransit = DB::connection('sqlsrv_ax_live')
-                            ->table($config['qo_table'])
-                            ->select(
-                                DB::raw("INVENTLOCATIONID as wh"),
-                                DB::raw("ITEMID as itemid"),
-                                DB::raw("SUM(QTY) as total_transit")
-                            )
-                            ->whereIn('ITEMID', $chunk)
-                            ->groupBy('INVENTLOCATIONID', 'ITEMID')
-                            ->get();
-
-                        foreach ($stokTransit as $row) {
-                            if (trim($row->wh) === '66') continue;
-
-                            DB::table('stocks')->updateOrInsert(
-                                [
-                                    'bu'               => $bu,
-                                    'inventlocationid' => trim($row->wh),
-                                    'itemid'           => trim($row->itemid),
-                                ],
-                                [
-                                    'stok_transit'     => (float) $row->total_transit,
-                                    'updated_at'       => now(),
-                                ]
-                            );
-                        }
+                // Execute Bulk Upsert Stok Fisik
+                if (!empty($stockBatch)) {
+                    foreach (array_chunk($stockBatch, 500) as $chunkData) {
+                        DB::table('stocks')->upsert(
+                            $chunkData,
+                            ['bu', 'inventlocationid', 'itemid'],
+                            ['stok_physical', 'updated_at']
+                        );
                     }
-                } catch (Exception $e) {
-                    Log::error("Gagal Tarik Transit BU {$bu}: " . $e->getMessage());
                 }
 
-                // 3. PO Outstanding
-                try {
-                    foreach ($itemChunks as $chunk) {
-                        $poOut = DB::connection('sqlsrv_ax_live')
-                            ->table($config['po_table'])
-                            ->select(
-                                DB::raw("INVENTLOCATIONID as wh"),
-                                DB::raw("ITEMID as itemid"),
-                                DB::raw("SUM(REMAINPURCHPHYSICAL) as total_po")
-                            )
-                            ->whereRaw("YEAR(createddatetime1) = ?", [$tahunIni])
-                            ->whereIn('ITEMID', $chunk)
-                            ->groupBy('INVENTLOCATIONID', 'ITEMID')
-                            ->get();
+                // 2. Tarik Stok Transit
+                $transitBatch = [];
+                foreach ($itemChunks as $chunk) {
+                    $stokTransit = DB::connection('sqlsrv_ax_live')
+                        ->table($config['qo_table'])
+                        ->select(
+                            DB::raw("INVENTLOCATIONID as wh"),
+                            DB::raw("ITEMID as itemid"),
+                            DB::raw("SUM(QTY) as total_transit")
+                        )
+                        ->whereIn('ITEMID', $chunk)
+                        ->groupBy('INVENTLOCATIONID', 'ITEMID')
+                        ->get();
 
-                        foreach ($poOut as $row) {
-                            if (trim($row->wh) === '66') continue;
+                    foreach ($stokTransit as $row) {
+                        $wh = trim($row->wh);
+                        if ($wh === '66') continue;
 
-                            DB::table('stocks')->updateOrInsert(
-                                [
-                                    'bu'               => $bu,
-                                    'inventlocationid' => trim($row->wh),
-                                    'itemid'           => trim($row->itemid),
-                                ],
-                                [
-                                    'po_outstanding'   => (float) $row->total_po,
-                                    'updated_at'       => now(),
-                                ]
-                            );
-                        }
+                        $transitBatch[] = [
+                            'bu'               => $bu,
+                            'inventlocationid' => $wh,
+                            'itemid'           => trim($row->itemid),
+                            'stok_transit'     => (float) $row->total_transit,
+                            'updated_at'       => now(),
+                        ];
                     }
-                } catch (Exception $e) {
-                    Log::error("Gagal Tarik PO Outstanding BU {$bu}: " . $e->getMessage());
+                }
+
+                if (!empty($transitBatch)) {
+                    foreach (array_chunk($transitBatch, 500) as $chunkData) {
+                        DB::table('stocks')->upsert(
+                            $chunkData,
+                            ['bu', 'inventlocationid', 'itemid'],
+                            ['stok_transit', 'updated_at']
+                        );
+                    }
+                }
+
+                // 3. Tarik PO Outstanding
+                $poBatch = [];
+                foreach ($itemChunks as $chunk) {
+                    $poOut = DB::connection('sqlsrv_ax_live')
+                        ->table($config['po_table'])
+                        ->select(
+                            DB::raw("INVENTLOCATIONID as wh"),
+                            DB::raw("ITEMID as itemid"),
+                            DB::raw("SUM(REMAINPURCHPHYSICAL) as total_po")
+                        )
+                        ->whereRaw("YEAR(createddatetime1) = ?", [$tahunIni])
+                        ->whereIn('ITEMID', $chunk)
+                        ->groupBy('INVENTLOCATIONID', 'ITEMID')
+                        ->get();
+
+                    foreach ($poOut as $row) {
+                        $wh = trim($row->wh);
+                        if ($wh === '66') continue;
+
+                        $poBatch[] = [
+                            'bu'               => $bu,
+                            'inventlocationid' => $wh,
+                            'itemid'           => trim($row->itemid),
+                            'po_outstanding'   => (float) $row->total_po,
+                            'updated_at'       => now(),
+                        ];
+                    }
+                }
+
+                if (!empty($poBatch)) {
+                    foreach (array_chunk($poBatch, 500) as $chunkData) {
+                        DB::table('stocks')->upsert(
+                            $chunkData,
+                            ['bu', 'inventlocationid', 'itemid'],
+                            ['po_outstanding', 'updated_at']
+                        );
+                    }
                 }
 
                 Log::info("Sync Stok Cabang BU {$bu}: Berhasil.");
@@ -552,8 +559,7 @@ class AxaptaSyncService
     }
 
     /**
-     * TAHAP 5: Penarikan SO Outstanding 41 Kolom Lengkap
-     * Otomatis memetakan manager_ax (SAMARINDA / BALIKPAPAN / PTK) via ERL_SUX_Organisasi_2026
+     * TAHAP 5: Penarikan SO Outstanding 41 Kolom Lengkap (Dioptimasi & Membaca ERL_SOOUTSTANDING)
      */
     public function syncSalesOrderOutstandings(): void
     {
@@ -581,49 +587,52 @@ class AxaptaSyncService
 
         DB::purge('sqlsrv_ax_live');
 
+        // 1. Ambil Pemetaan Sales Unit -> Manager Name & Manager AX dari ERL_SUX_Organisasi_2026
+        $territoryMap = [];
+        try {
+            $orgs = DB::connection('sqlsrv_ax_live')
+                ->table('ERL_SUX_Organisasi_2026')
+                ->select('salesunitid', 'nammgr', 'nammgr_name')
+                ->get();
 
-// 1. Ambil Pemetaan Sales Unit -> Manager & Nama Manager dari ERL_SUX_Organisasi_2026
-$territoryMap = [];
-try {
-    $orgs = DB::connection('sqlsrv_ax_live')
-        ->table('ERL_SUX_Organisasi_2026')
-        ->where('active', 1)
-        ->select('salesunitid', 'nammgr', 'nammgr_name') // <--- Tambahkan nammgr_name[cite: 13]
-        ->get();
+            foreach ($orgs as $o) {
+                $salesUnitKey = trim($o->salesunitid ?? '');
+                $mgr          = strtoupper(trim($o->nammgr ?? ''));
+                $mgrName      = trim($o->nammgr_name ?? '');
 
-    foreach ($orgs as $o) {
-        $mgr = strtoupper(trim($o->nammgr ?? ''));
-        $mgrName = trim($o->nammgr_name ?? ''); // <--- Ambil nama manager[cite: 13]
+                $labelMgr = $mgr;
+                if (str_contains($mgr, 'BALIKPAPAN')) {
+                    $labelMgr = 'MANAGER BALIKPAPAN';
+                } elseif (str_contains($mgr, 'SAMARINDA') || str_contains($mgr, 'BANJARMASIN')) {
+                    // Semua manager wilayah Samarinda maupun bekas Banjarmasin dipetakan ke MANAGER SAMARINDA
+                    $labelMgr = 'MANAGER SAMARINDA'; 
+                }
 
-        $labelMgr = $mgr;
-        if (str_contains($mgr, 'BALIKPAPAN')) {
-            $labelMgr = 'MANAGER BALIKPAPAN';
-        } elseif (str_contains($mgr, 'SAMARINDA')) {
-            $labelMgr = 'MANAGER SAMARINDA';
-        } elseif (str_contains($mgr, 'BANJARMASIN')) {
-            $labelMgr = 'MANAGER BANJARMASIN';
+                if (!empty($salesUnitKey)) {
+                    $territoryMap[$salesUnitKey] = [
+                        'manager_ax'   => !empty($labelMgr) ? $labelMgr : null,
+                        'manager_name' => !empty($mgrName) ? $mgrName : null,
+                    ];
+                }
+            }
+        } catch (\Exception $e) {
+            Log::error("Gagal membaca tabel ERL_SUX_Organisasi_2026: " . $e->getMessage());
         }
-
-        if (!empty($labelMgr)) {
-            $territoryMap[trim($o->salesunitid)] = [
-                'manager_ax'   => $labelMgr,
-                'manager_name' => $mgrName,
-            ];
-        }
-    }
-} catch (\Exception $e) {
-    Log::error("Gagal membaca tabel ERL_SUX_Organisasi_2026: " . $e->getMessage());
-}
 
         $branches = [
-            '59' => ['table' => 'SOOUTSTANDING59'],
-            '61' => ['table' => 'SOOUTSTANDING61'],
+            '59' => ['label' => 'Samarinda'],
+            '61' => ['label' => 'Pontianak'],
         ];
+
+        $tahunIni = date('Y');
 
         foreach ($branches as $bu => $config) {
             try {
+                // Tarik data dari View ERL_SOOUTSTANDING khusus cabang ($bu) dan TAHUN INI saja
                 $rawSo = DB::connection('sqlsrv_ax_live')
-                    ->table($config['table'])
+                    ->table('ERL_SOOUTSTANDING')
+                    ->where('DIMENSION', $bu)
+                    ->whereRaw("YEAR(createddatetime1) >= ?", [$tahunIni])
                     ->where(function ($q) {
                         $q->whereNull('tcn_sotype')
                           ->orWhere('tcn_sotype', 0)
@@ -645,16 +654,14 @@ try {
                     $school    = strtoupper(trim($getVal('agr_schoolid') ?? ''));
                     $salesUnit = trim($getVal('salesunitid') ?? '');
 
-                    // 2. Filter abaikan order SOI, Pameran, Konsinyasi (Persis seperti FoxPro)
+                    // Filter abaikan order SOI, Pameran, Konsinyasi
                     if (str_contains($salesId, 'SOI') || str_contains($school, 'PAMERAN') || str_contains($school, 'KONSINYASI')) {
                         continue;
                     }
 
-                    // 3. Tentukan Manager_AX dan Manager_Name dari hasil map
-$salesUnitInfo = $territoryMap[$salesUnit] ?? null;
-
-$managerAx   = $salesUnitInfo['manager_ax'] ?? ($bu === '61' ? 'MANAGER PTK' : 'MANAGER SAMARINDA');
-$managerName = $salesUnitInfo['manager_name'] ?? null; // <--- Nama Manager
+                    $salesUnitInfo = $territoryMap[$salesUnit] ?? null;
+                    $managerAx   = $salesUnitInfo['manager_ax'] ?? ($bu === '61' ? 'MANAGER PTK' : 'MANAGER SAMARINDA');
+                    $managerName = $salesUnitInfo['manager_name'] ?? null;
 
                     $qty         = (float) ($getVal('qtyordered') ?? $getVal('qty') ?? 0);
                     $soEks       = (int) abs($qty);
@@ -736,7 +743,7 @@ $managerName = $salesUnitInfo['manager_name'] ?? null; // <--- Nama Manager
                     }
                 }
 
-                Log::info("Sync Full SO Outstanding (SOOUTSTANDING{$bu}): Berhasil ditarik " . count($insertData) . " baris.");
+                Log::info("Sync Full SO Outstanding (Cabang BU {$bu}): Berhasil ditarik " . count($insertData) . " baris.");
             } catch (Exception $e) {
                 Log::error("Gagal Sync Full SO Outstanding BU {$bu}: " . $e->getMessage());
             }
@@ -746,7 +753,7 @@ $managerName = $salesUnitInfo['manager_name'] ?? null; // <--- Nama Manager
     }
 
     /**
-     * TAHAP GABUNGAN: Penarikan Stok Realtime & SO Outstanding Sekaligus
+     * TAHAP GABUNGAN
      */
     public function syncStocksAndSalesOrders(): void
     {
